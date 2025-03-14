@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import signal
@@ -34,6 +35,7 @@ from flytekit.core.base_task import Task, TaskMetadata, TaskResolverMixin
 from flytekit.core.constants import EAGER_ROOT_ENV_NAME
 from flytekit.core.context_manager import ExecutionState, FlyteContext, FlyteContextManager
 from flytekit.core.docstring import Docstring
+from flytekit.core.eager_controller import EagerController
 from flytekit.core.interface import Interface, transform_function_to_interface
 from flytekit.core.promise import (
     Promise,
@@ -468,6 +470,8 @@ class EagerAsyncPythonFunctionTask(AsyncPythonFunctionTask[T], metaclass=FlyteTr
         else:
             kwargs["metadata"] = TaskMetadata(is_eager=True)
 
+        self._controller = None
+
         super().__init__(
             task_config,
             task_function,
@@ -516,7 +520,19 @@ class EagerAsyncPythonFunctionTask(AsyncPythonFunctionTask[T], metaclass=FlyteTr
         # Args is present because the asyn helper function passes it, but everything should be in kwargs by this point
         assert len(args) == 1
         ctx = FlyteContextManager.current_context()
-        is_local_execution = cast(ExecutionState, ctx.execution_state).is_local_execution()
+        if self._controller is None:
+            tag = ctx.user_space_params.execution_id.name
+            root_tag = os.environ.get(EAGER_ROOT_ENV_NAME, tag)
+
+            # Prefix is a combination of the name of this eager workflow, and the current execution id.
+            prefix = self.name.split(".")[-1][:8]
+            prefix = f"e-{prefix}-{tag[:5]}"
+            prefix = _dnsify(prefix)
+            controller = EagerController(prefix)
+            self._controller = asyncio.create_task(controller.run())
+            ctx = ctx.with_worker_queue(controller).build()
+            FlyteContextManager.push_context(ctx)
+        is_local_execution = False # cast(ExecutionState, ctx.execution_state).is_local_execution()
         if not is_local_execution:
             # a real execution
             return await self.run_with_backend(**kwargs)
@@ -530,9 +546,10 @@ class EagerAsyncPythonFunctionTask(AsyncPythonFunctionTask[T], metaclass=FlyteTr
 
     def execute(self, **kwargs) -> Any:
         ctx = FlyteContextManager.current_context()
-        is_local_execution = cast(ExecutionState, ctx.execution_state).is_local_execution()
+        is_local_execution = False # cast(ExecutionState, ctx.execution_state).is_local_execution()
         builder = ctx.new_builder()
         if not is_local_execution:
+            print("Executing remote!")
             # ensure that the worker queue is in context
             if not ctx.worker_queue:
                 from flytekit.configuration.plugin import get_plugin
@@ -578,11 +595,15 @@ class EagerAsyncPythonFunctionTask(AsyncPythonFunctionTask[T], metaclass=FlyteTr
                 # Note: The construction of this object is in this function because this function should be on the
                 # main thread of pyflyte-execute. It needs to be on the main thread because signal handlers can only
                 # be installed on the main thread.
-                c = Controller(remote=remote, ss=ss, tag=tag, root_tag=root_tag, exec_prefix=prefix)
-                handler = c.get_signal_handler()
-                signal.signal(signal.SIGINT, handler)
-                signal.signal(signal.SIGTERM, handler)
-                builder = ctx.with_worker_queue(c)
+                # c = Controller(remote=remote, ss=ss, tag=tag, root_tag=root_tag, exec_prefix=prefix)
+                # handler = c.get_signal_handler()
+                # signal.signal(signal.SIGINT, handler)
+                # signal.signal(signal.SIGTERM, handler)
+                # builder = ctx.with_worker_queue(c)
+                # c = EagerController(prefix)
+                # builder = ctx.with_worker_queue(c)
+                # c.start()
+                print("Added Controller!")
             else:
                 raise AssertionError("Worker queue should not be already present in the context for eager execution")
         with FlyteContextManager.with_context(builder):
@@ -609,10 +630,11 @@ class EagerAsyncPythonFunctionTask(AsyncPythonFunctionTask[T], metaclass=FlyteTr
                 logger.error(f"Leaving eager execution because of {ee}")
                 base_error = ee
 
-            html = cast(Controller, ctx.worker_queue).render_html()
-            Deck("Eager Executions", html)
+            # html = cast(Controller, ctx.worker_queue).render_html()
+            # Deck("Eager Executions", html)
 
             if base_error:
+                print(base_error.with_traceback(None))
                 # now have to fail this eager task, because we don't want it to show up as succeeded.
                 raise FlyteNonRecoverableSystemException(base_error)
             return result
